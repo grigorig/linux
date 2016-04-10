@@ -26,26 +26,14 @@
 
 #define DEFAULT_TIMEOUT   1000
 
-/* flags for IO-Bits */
-#define CH341_BIT_RTS (1 << 6)
-#define CH341_BIT_DTR (1 << 5)
-
 /******************************/
 /* interrupt pipe definitions */
 /******************************/
 /* always 4 interrupt bytes */
-/* first irq byte normally 0x08 */
-/* second irq byte base 0x7d + below */
-/* third irq byte base 0x94 + below */
-/* fourth irq byte normally 0xee */
-
-/* status returned in third interrupt answer byte, inverted in data
-   from irq */
-#define CH341_BIT_CTS 0x01
-#define CH341_BIT_DSR 0x02
-#define CH341_BIT_RI  0x04
-#define CH341_BIT_DCD 0x08
-#define CH341_BITS_MODEM_STAT 0x0f /* all bits */
+/* first irq byte normally 0x08 + rx status */
+/* second irq byte base 0x7d + general status */
+/* third irq byte base 0x94 + line status */
+/* fourth irq byte normally 0xee + portc status */
 
 /*******************************/
 /* baudrate calculation factor */
@@ -53,20 +41,26 @@
 #define CH341_BAUDBASE_FACTOR 1532620800
 #define CH341_BAUDBASE_DIVMAX 3
 
-/* Break support - the information used to implement this was gleaned from
- * the Net/FreeBSD uchcom.c driver by Takanori Watanabe.  Domo arigato.
- */
-
+/* Commands */
 #define CH341_SERIAL_INIT      0xA1
 #define CH341_VERSION          0x5F
 #define CH341_MODEM_CTRL       0xA4
 #define CH341_REQ_WRITE_REG    0x9A
 #define CH341_REQ_READ_REG     0x95
-#define CH341_REG_BREAK1       0x05
+
+/* Registers for WRITE_REG/READ_REG */
+#define CH341_REG_BREAK        0x05
+#define CH341_REG_LINE         0x06
+#define CH341_REG_STATUS       0x07
 #define CH341_REG_LCR          0x18
 #define CH341_REG_RTSCTS       0x27
-#define CH341_NBREAK_BITS_REG1 0x01
 
+/* Break support - the information used to implement this was gleaned from
+ * the Net/FreeBSD uchcom.c driver by Takanori Watanabe.  Domo arigato.
+ */
+#define CH341_BREAK_BITS       0x01
+
+/* LCR register bits and values */
 #define CH341_LCR_ENABLE_RX    0x80
 #define CH341_LCR_ENABLE_TX    0x40
 #define CH341_LCR_MARK_SPACE   0x20
@@ -78,9 +72,26 @@
 #define CH341_LCR_CS6          0x01
 #define CH341_LCR_CS5          0x00
 
-/* General status from register 0x07 and second interrupt byte */
+/* General status bits (also available in second interrupt byte) */
 #define CH341_STATUS_TXBUSY    0x01
 #define CH341_STATUS_MULTI     0x04
+
+/* Line status bits (also available in third interrupt byte) */
+#define CH341_LINE_CTS         0x01
+#define CH341_LINE_DSR         0x02
+#define CH341_LINE_RI          0x04
+#define CH341_LINE_DCD         0x08
+#define CH341_LINE_MASK        0x0f /* all bits */
+
+/* Line control bits for MODEM_CTRL command */
+#define CH341_CTRL_OUT         0x10
+#define CH341_CTRL_DTR         0x20
+#define CH341_CTRL_RTS         0x40
+
+/* RX status bits */
+#define CH341_RX_OVERRUN_ERR   0x01
+#define CH341_RX_PARITY_ERR    0x02
+#define CH341_RX_FRAME_ERR     0x04
 
 static const struct usb_device_id id_table[] = {
 	{ USB_DEVICE(0x4348, 0x5523) },
@@ -174,12 +185,13 @@ static int ch341_get_status(struct usb_device *dev, struct ch341_private *priv)
 	int r;
 	const unsigned size = 2;
 	unsigned long flags;
+	const uint16_t reg = CH341_REG_LINE | ((uint16_t)CH341_REG_STATUS);
 
 	buffer = kmalloc(size, GFP_KERNEL);
 	if (!buffer)
 		return -ENOMEM;
 
-	r = ch341_control_in(dev, CH341_REQ_READ_REG, 0x0706, 0, buffer, size);
+	r = ch341_control_in(dev, CH341_REQ_READ_REG, reg, 0, buffer, size);
 	if (r < 0)
 		goto out;
 
@@ -187,7 +199,7 @@ static int ch341_get_status(struct usb_device *dev, struct ch341_private *priv)
 	if (r == 2) {
 		r = 0;
 		spin_lock_irqsave(&priv->lock, flags);
-		priv->line_status = (~buffer[0]) & CH341_BITS_MODEM_STAT;
+		priv->line_status = (~buffer[0]) & CH341_LINE_MASK;
 		priv->uart_status = buffer[1];
 		spin_unlock_irqrestore(&priv->lock, flags);
 	} else {
@@ -295,7 +307,7 @@ static int ch341_port_remove(struct usb_serial_port *port)
 static int ch341_carrier_raised(struct usb_serial_port *port)
 {
 	struct ch341_private *priv = usb_get_serial_port_data(port);
-	if (priv->line_status & CH341_BIT_DCD)
+	if (priv->line_status & CH341_LINE_DCD)
 		return 1;
 	return 0;
 }
@@ -308,9 +320,9 @@ static void ch341_dtr_rts(struct usb_serial_port *port, int on)
 	/* drop DTR and RTS */
 	spin_lock_irqsave(&priv->lock, flags);
 	if (on)
-		priv->line_control |= CH341_BIT_RTS | CH341_BIT_DTR;
+		priv->line_control |= CH341_CTRL_RTS | CH341_CTRL_DTR;
 	else
-		priv->line_control &= ~(CH341_BIT_RTS | CH341_BIT_DTR);
+		priv->line_control &= ~(CH341_CTRL_RTS | CH341_CTRL_DTR);
 	spin_unlock_irqrestore(&priv->lock, flags);
 	ch341_set_handshake(port->serial->dev, priv->line_control);
 }
@@ -399,7 +411,7 @@ static void ch341_set_termios(struct tty_struct *tty,
 	if (C_BAUD(tty) != B0) {
 		if (old_termios && (old_termios->c_cflag & CBAUD) == B0) {
 			spin_lock_irqsave(&priv->lock, flags);
-			priv->line_control |= (CH341_BIT_DTR | CH341_BIT_RTS);
+			priv->line_control |= (CH341_CTRL_DTR | CH341_CTRL_RTS);
 			spin_unlock_irqrestore(&priv->lock, flags);
 		}
 		r = ch341_init_set_baudrate(port->serial->dev, priv, ctrl);
@@ -409,7 +421,7 @@ static void ch341_set_termios(struct tty_struct *tty,
 		}
 	} else {
 		spin_lock_irqsave(&priv->lock, flags);
-		priv->line_control &= ~(CH341_BIT_DTR | CH341_BIT_RTS);
+		priv->line_control &= ~(CH341_CTRL_DTR | CH341_CTRL_RTS);
 		spin_unlock_irqrestore(&priv->lock, flags);
 	}
 
@@ -429,7 +441,7 @@ static void ch341_set_termios(struct tty_struct *tty,
 static void ch341_break_ctl(struct tty_struct *tty, int break_state)
 {
 	const uint16_t ch341_break_reg =
-		CH341_REG_BREAK1 | ((uint16_t) CH341_REG_LCR << 8);
+		CH341_REG_BREAK | ((uint16_t) CH341_REG_LCR << 8);
 	struct usb_serial_port *port = tty->driver_data;
 	int r;
 	uint16_t reg_contents;
@@ -449,11 +461,11 @@ static void ch341_break_ctl(struct tty_struct *tty, int break_state)
 		break_reg[0], break_reg[1]);
 	if (break_state != 0) {
 		dev_dbg(&port->dev, "Enter break state requested\n");
-		break_reg[0] &= ~CH341_NBREAK_BITS_REG1;
+		break_reg[0] &= ~CH341_BREAK_BITS;
 		break_reg[1] &= ~CH341_LCR_ENABLE_TX;
 	} else {
 		dev_dbg(&port->dev, "Leave break state requested\n");
-		break_reg[0] |= CH341_NBREAK_BITS_REG1;
+		break_reg[0] |= CH341_BREAK_BITS;
 		break_reg[1] |= CH341_LCR_ENABLE_TX;
 	}
 	dev_dbg(&port->dev, "New break register contents - reg1: %x, reg2: %x\n",
@@ -477,13 +489,13 @@ static int ch341_tiocmset(struct tty_struct *tty,
 
 	spin_lock_irqsave(&priv->lock, flags);
 	if (set & TIOCM_RTS)
-		priv->line_control |= CH341_BIT_RTS;
+		priv->line_control |= CH341_CTRL_RTS;
 	if (set & TIOCM_DTR)
-		priv->line_control |= CH341_BIT_DTR;
+		priv->line_control |= CH341_CTRL_DTR;
 	if (clear & TIOCM_RTS)
-		priv->line_control &= ~CH341_BIT_RTS;
+		priv->line_control &= ~CH341_CTRL_RTS;
 	if (clear & TIOCM_DTR)
-		priv->line_control &= ~CH341_BIT_DTR;
+		priv->line_control &= ~CH341_CTRL_DTR;
 	control = priv->line_control;
 	spin_unlock_irqrestore(&priv->lock, flags);
 
@@ -502,7 +514,7 @@ static void ch341_update_line_status(struct usb_serial_port *port,
 	if (len < 4)
 		return;
 
-	status = ~data[2] & CH341_BITS_MODEM_STAT;
+	status = ~data[2] & CH341_LINE_MASK;
 
 	spin_lock_irqsave(&priv->lock, flags);
 	delta = status ^ priv->line_status;
@@ -515,18 +527,18 @@ static void ch341_update_line_status(struct usb_serial_port *port,
 	if (!delta)
 		return;
 
-	if (delta & CH341_BIT_CTS)
+	if (delta & CH341_LINE_CTS)
 		port->icount.cts++;
-	if (delta & CH341_BIT_DSR)
+	if (delta & CH341_LINE_DSR)
 		port->icount.dsr++;
-	if (delta & CH341_BIT_RI)
+	if (delta & CH341_LINE_RI)
 		port->icount.rng++;
-	if (delta & CH341_BIT_DCD) {
+	if (delta & CH341_LINE_DCD) {
 		port->icount.dcd++;
 		tty = tty_port_tty_get(&port->port);
 		if (tty) {
 			usb_serial_handle_dcd_change(port, tty,
-						status & CH341_BIT_DCD);
+						status & CH341_LINE_DCD);
 			tty_kref_put(tty);
 		}
 	}
@@ -581,12 +593,12 @@ static int ch341_tiocmget(struct tty_struct *tty)
 	status = priv->line_status;
 	spin_unlock_irqrestore(&priv->lock, flags);
 
-	result = ((mcr & CH341_BIT_DTR)		? TIOCM_DTR : 0)
-		  | ((mcr & CH341_BIT_RTS)	? TIOCM_RTS : 0)
-		  | ((status & CH341_BIT_CTS)	? TIOCM_CTS : 0)
-		  | ((status & CH341_BIT_DSR)	? TIOCM_DSR : 0)
-		  | ((status & CH341_BIT_RI)	? TIOCM_RI  : 0)
-		  | ((status & CH341_BIT_DCD)	? TIOCM_CD  : 0);
+	result = ((mcr & CH341_CTRL_DTR)	? TIOCM_DTR : 0)
+		  | ((mcr & CH341_CTRL_RTS)	? TIOCM_RTS : 0)
+		  | ((status & CH341_LINE_CTS)	? TIOCM_CTS : 0)
+		  | ((status & CH341_LINE_DSR)	? TIOCM_DSR : 0)
+		  | ((status & CH341_LINE_RI)	? TIOCM_RI  : 0)
+		  | ((status & CH341_LINE_DCD)	? TIOCM_CD  : 0);
 
 	dev_dbg(&port->dev, "Result = %x\n", result);
 
